@@ -1058,8 +1058,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 // ---------------------------------------------------------------------------------------------
 // Render stage 2: real pipelines and draws for the shaders that have a translation.
 //
-// Stream pipelines (console subobject streams) have no shader translation yet; pipelines
-// described the other way go through the offline translation cache (d3d12_draw.inl).
+// Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
 #include "startup_stubs/d3d12_capture.inl"
 
@@ -1140,11 +1139,12 @@ ID3DBlob* compile_translation(const void* container, const std::vector<RootParam
     return nullptr;
 }
 
+constexpr std::size_t stream_sizes[23] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8, 48, 56, 24, 8, 8, 40, 8, 16, 8, 24, 8, 64, 24};
+
 // Converts a console pipeline stream to desktop form and creates the pipeline. The subobject type
 // numbers and sizes are the desktop ones; only the pointers and formats inside need converting.
 ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size)
 {
-    static const std::size_t sizes[23] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8, 48, 56, 24, 8, 8, 40, 8, 16, 8, 24, 8, 64, 24};
     const std::size_t bytes = desc->SizeInBytes;
     if (bytes < 16 || bytes > 0x2000 || (bytes & 7) || !x2w_local::readable(desc->pPipelineStateSubobjectStream, bytes)) {
         std::snprintf(why, why_size, "stream not readable");
@@ -1159,9 +1159,13 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     // First pass: find the root signature (shader translation needs it).
     for (std::size_t offset = 0; offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
-        if (type > 22) { ok = false; std::snprintf(why, why_size, "console subobject type %u at +0x%zx", type, offset); break; }
+        if (type >= std::size(stream_sizes) || stream_sizes[type] > bytes - offset) {
+            ok = false;
+            std::snprintf(why, why_size, "unknown or truncated subobject %u at +0x%zx", type, offset);
+            break;
+        }
         if (type == 0) root = root_info(as_wrapper(*reinterpret_cast<void**>(stream + offset + 8)));
-        offset += sizes[type];
+        offset += stream_sizes[type];
     }
     for (std::size_t offset = 0; ok && offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
@@ -1189,7 +1193,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
             auto* format = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
             *format = desktop_format(*format);
         }
-        offset += sizes[type];
+        offset += stream_sizes[type];
     }
     ID3D12PipelineState* pipeline = nullptr;
     if (ok) {
@@ -2134,15 +2138,20 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
             desc->pPipelineStateSubobjectStream, static_cast<unsigned long long>(desc->SizeInBytes), text);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     ID3D12PipelineState* real_pipeline = nullptr;
+    Translation* translation = nullptr;
+    D3D12_BLEND_DESC blend{};
+    bool has_blend = false;
     if (render_mode()) {
         char why[256] = "";
-        real_pipeline = build_stream_pipeline(desc, why, sizeof(why));
+        translation = stream_translation(*desc, blend, has_blend);
+        if (!translation) real_pipeline = build_stream_pipeline(desc, why, sizeof(why));
         static LONG built;
-        if (first_calls(built, 24))
+        if (!translation && first_calls(built, 24))
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);
     }
     *out = wrap(real_pipeline, pipeline_kind);
-    note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000);
+    note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
+                  translation, translation && has_blend ? &blend : nullptr);
     return S_OK;
 }
 

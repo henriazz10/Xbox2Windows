@@ -111,5 +111,8 @@ These are measured on one executable; treat them as hypotheses for others.
 - BCPack requests are completed with zero-filled destinations (blank textures).
 - XG layouts are the desktop copyable-footprint layout, not the console tiling.
 - Dynamically indexed sampler-heap loads become a default sampler.
-- Stream pipelines (console subobject streams) have no shader translation.
+- Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
+  complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
+  reloads the compiled stages. Run `ctest --preset release --no-tests=error -R ^startup_stream_request_warp$`.
+  Other stage combinations and full stream rasterizer/depth state remain open.
 - Audio produces no output.

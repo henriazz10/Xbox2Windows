@@ -183,6 +183,67 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
         tr.samplers.size());
 }
 
+// draw_lock held. Both pipeline forms use the same request writer and shader cache.
+Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
+                                const std::vector<unsigned char>& root_blob)
+{
+    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes)));
+    auto& entry = translation_by_key()[key];
+    if (!entry) {
+        entry = new Translation;
+        entry->key = key;
+        load_translation(*entry, a, a_bytes, b, b_bytes, root_blob);
+    }
+    return entry;
+}
+
+// Resolve the shader pointers and wrapped root while the caller still owns the stream.
+Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend)
+{
+    const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
+    if (!desc.SizeInBytes || desc.SizeInBytes > 0x2000 || desc.SizeInBytes % 8 ||
+        !x2w_local::readable(stream, desc.SizeInBytes)) return nullptr;
+
+    const Wrapper* root = nullptr;
+    D3D12_SHADER_BYTECODE stages[2]{};
+    unsigned seen = 0;
+    for (std::size_t at = 0; at < desc.SizeInBytes;) {
+        unsigned type;
+        std::memcpy(&type, stream + at, sizeof(type));
+        if (type >= std::size(stream_sizes) || stream_sizes[type] > desc.SizeInBytes - at || (seen & (1u << type)))
+            return nullptr;
+        seen |= 1u << type;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+            std::memcpy(&root, stream + at + 8, sizeof(root));
+        } else if (type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+            D3D12_SHADER_BYTECODE shader;
+            std::memcpy(&shader, stream + at + 8, sizeof(shader));
+            if (shader.pShaderBytecode || shader.BytecodeLength) {
+                if (type > D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS || shader.BytecodeLength < 32 ||
+                    shader.BytecodeLength > (1u << 20) || !x2w_local::readable(shader.pShaderBytecode, shader.BytecodeLength) ||
+                    std::memcmp(shader.pShaderBytecode, "DXBC", 4)) return nullptr;
+                stages[type - D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS] = shader;
+            }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
+            std::memcpy(&blend, stream + at + sizeof(type), sizeof(blend));
+            has_blend = true;
+        }
+        at += stream_sizes[type];
+    }
+    if (!root || !stages[0].pShaderBytecode || !stages[1].pShaderBytecode) return nullptr;
+    std::vector<unsigned char> root_blob;
+    AcquireSRWLockShared(&note_lock);
+    const auto found = root_blobs().find(root);
+    if (found != root_blobs().end()) root_blob = found->second;
+    ReleaseSRWLockShared(&note_lock);
+    if (root_blob.empty()) return nullptr;
+    AcquireSRWLockExclusive(&draw_lock);
+    auto* result = cached_translation(stages[0].pShaderBytecode, stages[0].BytecodeLength,
+                                      stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob);
+    ReleaseSRWLockExclusive(&draw_lock);
+    return result;
+}
+
 // draw_lock held.
 BoundPipeline* translation_for(Wrapper* pipeline)
 {
@@ -199,7 +260,10 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         std::size_t where = 0;
         const char* from = "none";
         if (own && own != info && find_blend(own->desc, &bound->blend, &where)) from = "derived description";
-        else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
+        else if (info && info->has_stream_blend) {
+            from = "stream blend subobject";
+            bound->blend = info->stream_blend;
+        } else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
         else if (info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
         bound->has_blend = from[0] != 'n';
         static LONG logged;
@@ -222,6 +286,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
             }
         }
     }
+    if (info && info->path == 86) result = info->stream_translation;
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
@@ -238,17 +303,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         const std::size_t a_bytes = static_cast<std::size_t>(words[6]), b_bytes = static_cast<std::size_t>(words[10]);
         if (!root_blob.empty() && a_bytes && b_bytes && a_bytes <= (1u << 20) && b_bytes <= (1u << 20) && x2w_local::readable(a, a_bytes) &&
             x2w_local::readable(b, b_bytes)) {
-            const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes)));
-            auto& by_key = translation_by_key();
-            const auto found = by_key.find(key);
-            if (found != by_key.end()) {
-                result = found->second;
-            } else {
-                result = new Translation;
-                result->key = key;
-                by_key[key] = result;
-                load_translation(*result, a, a_bytes, b, b_bytes, root_blob);
-            }
+            result = cached_translation(a, a_bytes, b, b_bytes, root_blob);
         }
     }
     by_pipeline[pipeline] = bound;

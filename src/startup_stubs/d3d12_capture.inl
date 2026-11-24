@@ -8,7 +8,11 @@
 // an argument points at), PSO / ROOT / RES / HEAP (objects, once each), VIEW (descriptor contents),
 // TABL (descriptor table binds), PRES (present). tools read it with out/gamerun/capture.py.
 
+struct Translation;
 struct PipelineInfo {
+    Translation* stream_translation = nullptr;
+    bool has_stream_blend = false;
+    D3D12_BLEND_DESC stream_blend{};
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
     std::vector<unsigned char> desc;
@@ -73,9 +77,15 @@ bool title_backed(u64 title_handle, u64 bytes)
     return inside;
 }
 
-void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes)
+void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
+                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr)
 {
     PipelineInfo info;
+    info.stream_translation = translation;
+    if (blend) {
+        info.stream_blend = *blend;
+        info.has_stream_blend = true;
+    }
     info.path = path;
     info.base = as_wrapper(base);
     const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;

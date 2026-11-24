@@ -991,7 +991,22 @@ def translate_request(out_dir, key):
     name = os.path.join(out_dir, 'req_%016x' % key)
     a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     try:
-        kinds = {classify(a): a, classify(b): b}
+        if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
+            # Slot 86 records complete containers in canonical (VS, PS) order.
+            # Keep the container bytes in the cache key; translate only the bounded native code.
+            import zlib
+            from pixel_aot import container_code
+            from resource_inventory import parts
+            try:
+                a, b = (container_code(parts(blob)[b'DXIL'], stage=stage)
+                        for blob, stage in ((a, 1), (b, 0)))
+            except (KeyError, ValueError, struct.error, zlib.error) as error:
+                raise Unsupported('invalid stream shader: %s' % error) from error
+            if classify(a) != 'vs' or classify(b) != 'ps':
+                raise Unsupported('stream stage and shader export disagree')
+            kinds = {'vs': a, 'ps': b}
+        else:
+            kinds = {classify(a): a, classify(b): b}
     except Unsupported as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
