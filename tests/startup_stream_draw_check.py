@@ -1,0 +1,70 @@
+"""Draw two source-built gfx1013 pixel shaders through a slot-86 wrapper and check every RGBA byte."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+from startup_stream_check import container, gfx2hlsl
+
+
+def vop1(op, dst, src):
+    return 0x7e000000 | dst << 17 | op << 9 | src
+
+
+def vop2(op, dst, src0, vsrc1):
+    return op << 25 | dst << 17 | vsrc1 << 9 | src0
+
+
+def vertex():
+    # Position from vertex ID i: x = 2 * ((2*i) & 2) - 1; y = 2 * (i & 2) - 1.
+    words = [vop2(0x1a, 1, 129, 0), vop2(0x1b, 1, 130, 1), vop2(0x1b, 2, 130, 0)]
+    for v in (1, 2):
+        words.extend([vop1(6, v, 256 + v), vop2(8, v, 244, v), vop2(3, v, 243, v)])
+    words.extend([vop1(1, 3, 128), vop1(1, 4, 242), 0xf80008cf, 0x04030201, 0xbf810000])
+    return container(1, words)
+
+
+def pixel(green):
+    # v0 = 0.0, v1 = 1.0. Export opaque red or opaque green.
+    channels = 0x01000100 if green else 0x01000001
+    return container(0, [vop1(1, 0, 128), vop1(1, 1, 242), 0xf800180f, channels, 0xbf810000])
+
+
+def check(directory, consumer, backend):
+    cache = directory / "cache"
+    cache.mkdir()
+    vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
+    vs.write_bytes(vertex())
+    args = [consumer, vs, ps, root]
+    env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
+               X2W_D3D12_DEBUG="0", X2W_SHADER_CACHE=str(cache))
+    observations = []
+    for green in (False, True):
+        ps.write_bytes(pixel(green))
+        subprocess.run(args, env=env, check=True)
+        subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
+        result = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+        print(result.stdout, end="")
+        if backend == "hardware" and result.returncode == 77:
+            print("No D3D12 feature-level 12 hardware adapter")
+            return 77
+        if result.returncode or "-> drawn;" not in result.stderr:
+            raise RuntimeError(f"draw failed on {backend}: {result.returncode}\n{result.stderr}")
+
+        pixels = output.read_bytes()
+        color = bytes((0, 255, 0, 255) if green else (255, 0, 0, 255))
+        clear = bytes((0, 0, 255, 255))
+        expected = (color * 4 + clear * 4) * 4
+        if pixels != expected:
+            raise AssertionError(f"actual {pixels.hex()} expected {expected.hex()}")
+        observations.append(pixels)
+    wrong = sum(observations[0][i:i+4] != observations[1][i:i+4] for i in range(0, 8 * 4 * 4, 4))
+    assert wrong == 16, f"swapping the pixel shader produced {wrong} changed pixels"
+    print(f"{backend}: red/green draws exact, 32 RGBA pixels each; swapped shader differs at {wrong} of 32")
+    return 0
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as temp:
+        sys.exit(check(Path(temp), *sys.argv[1:]))

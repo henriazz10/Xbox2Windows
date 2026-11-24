@@ -11,16 +11,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/startup"))
 import gfx2hlsl
 
 
-def container(stage):
+def container(stage, words=None):
     # One straight-line export (pos0 or mrt0) followed by s_endpgm and section padding.
     target = 12 if stage == 1 else 0
-    code = struct.pack("<III", 0xf800080f | target << 4, 0, 0xbf810000)
-    image = bytearray(312)
+    words = words if words is not None else [0xf800080f | target << 4, 0, 0xbf810000]
+    code = struct.pack("<%dI" % len(words), *words)
+    extent = (40 + len(code) + 4 + 15) & ~15
+    image = bytearray(248 + extent)
     image[:4] = b"FSSM"
     struct.pack_into("<I", image, 4, 0x101)
-    struct.pack_into("<QQ", image, 192, 248, 64)
-    struct.pack_into("<Q", image, 232, 312)
-    image[288:] = code + struct.pack("<3I", *([0xbf9f0000] * 3))
+    struct.pack_into("<QQ", image, 192, 248, extent)
+    struct.pack_into("<Q", image, 232, len(image))
+    image[288:288 + len(code)] = code
+    padding = (len(image) - 288 - len(code)) // 4
+    image[288 + len(code):] = struct.pack("<I", 0xbf9f0000) * padding
     native = b"XBCH" + bytes(12) + struct.pack("<II", len(image), 0) + zlib.compress(image)
     program = (struct.pack("<HH", 0, stage) + bytes(20) + b"XDAT"
                + struct.pack("<5I", 1, 0, 13, 48, len(native)) + native)
