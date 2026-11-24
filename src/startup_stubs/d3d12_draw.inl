@@ -429,11 +429,9 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 }
 
 // Per-draw dumps (X2W_DRAW_DUMP_FRAME=<frame>, X2W_DRAW_DUMP_DIR=<folder>): during that frame, render
-// target 0 is copied to a readback buffer after every translated draw (at most 48); 30 frames later
-// the copies are written as BMPs reduced 4x (draw_<n>_<pipeline>.bmp), so one run shows what each
-// draw added. Only 4-byte target formats are written.
-struct DrawDump { ID3D12Resource* buffer; D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint; UINT rows; u64 key; UINT count; DXGI_FORMAT format; };
-std::vector<DrawDump>& draw_dumps() { static std::vector<DrawDump> v; return v; }
+// target 0 is copied to a readback buffer after each translated draw (at most 48).
+// Poll the fence of the queue that actually executed the recording before writing its image.
+using x2w_startup::DrawDump;
 LONG draw_dump_frame()
 {
     static const LONG frame = [] {
@@ -446,7 +444,7 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
 {
     Pass& pass = pass_of(self);
     const LONG wanted = draw_dump_frame();
-    if (!wanted || frame_number < wanted || frame_number > wanted + 1 || !pass.target0 || draw_dumps().size() >= 48) return;
+    if (!wanted || frame_number < wanted || frame_number > wanted + 1 || !pass.target0 || draw_dumps().full()) return;
     const D3D12_RESOURCE_DESC desc = pass.target0->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rows = 0;
@@ -464,6 +462,14 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
     ID3D12Resource* readback = nullptr;
     if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                               IID_PPV_ARGS(&readback)))) return;
+    DrawDump dump{};
+    dump.buffer.Attach(readback);
+    dump.footprint = footprint;
+    dump.rows = rows;
+    dump.key = key;
+    dump.count = count;
+    dump.format = desc.Format;
+    if (!draw_dumps().record(list, std::move(dump))) return;
     require_state(self, pass.target0, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION target{readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     target.PlacedFootprint = footprint;
@@ -471,18 +477,17 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
     source.SubresourceIndex = 0;
     list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
     require_state(self, pass.target0, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    draw_dumps().push_back({readback, footprint, rows, key, count, desc.Format});
 }
-void draw_dump_flush(LONG frame)
+void draw_dump_flush()
 {
-    const LONG wanted = draw_dump_frame();
-    if (!wanted || frame != wanted + 30) return;
+    if (!draw_dump_frame()) return;
+    auto completed = draw_dumps().take_completed();
+    if (completed.empty()) return;
     char folder[MAX_PATH] = ".";
     GetEnvironmentVariableA("X2W_DRAW_DUMP_DIR", folder, sizeof(folder));
-    AcquireSRWLockExclusive(&draw_lock);
-    int index = 0;
-    for (const DrawDump& dump : draw_dumps()) {
-        ++index;
+    int written = 0;
+    for (const DrawDump& dump : completed) {
+        const int index = static_cast<int>(dump.index);
         const UINT bytes_per_pixel = dump.footprint.Footprint.RowPitch / (dump.footprint.Footprint.Width ? dump.footprint.Footprint.Width : 1);
         void* mapped = nullptr;
         if (bytes_per_pixel != 4 || FAILED(dump.buffer->Map(0, nullptr, &mapped))) continue;
@@ -516,10 +521,10 @@ void draw_dump_flush(LONG frame)
             std::fwrite(header, 1, 54, file);
             std::fwrite(pixels.data(), 1, pixels.size(), file);
             std::fclose(file);
+            ++written;
         }
     }
-    log("x2w-draw per-draw dump: %d target copies written to %s", index, folder);
-    ReleaseSRWLockExclusive(&draw_lock);
+    log("x2w-draw per-draw dump: %d target copies written to %s", written, folder);
 }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)

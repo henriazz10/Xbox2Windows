@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/draw_dump_tracking.h"
 
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
@@ -851,6 +852,13 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
     list->ResourceBarrier(1, &barrier);
 }
 
+LONG draw_dump_frame();
+x2w_startup::DrawReadbacks& draw_dumps()
+{
+    static x2w_startup::DrawReadbacks tracker;
+    return tracker;
+}
+
 LONG render_resets, render_closes, render_clears, render_executes, render_reset_failures;
 
 // List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
@@ -860,6 +868,10 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     HRESULT hr = E_INVALIDARG;
     if (a && a->own().kind == allocator_kind && self->own().real)
         hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Reset(static_cast<ID3D12CommandAllocator*>(a->own().real), nullptr);
+    if (SUCCEEDED(hr)) {
+        self->own().list_ready = false;
+        if (draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
+    }
     self->own().list_open = SUCCEEDED(hr);
     InterlockedIncrement(SUCCEEDED(hr) ? &render_resets : &render_reset_failures);
     static LONG failures;
@@ -876,6 +888,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         const HRESULT hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Close();
         self->own().list_open = false;
         self->own().list_ready = SUCCEEDED(hr);
+        if (FAILED(hr) && draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
         InterlockedIncrement(&render_closes);
         static LONG failures;
         if (FAILED(hr) && first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
@@ -1452,7 +1465,14 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             }
         }
         if (!ready.empty()) {
-            static_cast<ID3D12CommandQueue*>(self->own().real)->ExecuteCommandLists(static_cast<UINT>(ready.size()), ready.data());
+            auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
+            const UINT ready_count = static_cast<UINT>(ready.size());
+            if (draw_dump_frame()) {
+                const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
+                if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
+            } else {
+                queue->ExecuteCommandLists(ready_count, ready.data());
+            }
             InterlockedIncrement(&render_executes);
         }
         check_device("CommandQueue execute", 35);
@@ -2368,7 +2388,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
     frame_number = frame;
-    draw_dump_flush(frame);
+    draw_dump_flush();
     {
         static const LONG wanted = [] {
             char value[16]{};

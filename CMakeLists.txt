@@ -241,6 +241,13 @@ add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
 
+add_executable(startup_dump_fence_check tests/startup_dump_fence.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_dump_fence_check PRIVATE cxx_std_17)
+target_include_directories(startup_dump_fence_check PRIVATE src)
+target_link_libraries(startup_dump_fence_check PRIVATE d3d12 dxgi)
+add_test(NAME startup_dump_fence_warp COMMAND startup_dump_fence_check)
+set_tests_properties(startup_dump_fence_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=warp" TIMEOUT 45)
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")

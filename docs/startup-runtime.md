@@ -72,7 +72,7 @@ adds memory dumps to the stop report.
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes `req_<key>.{a,b,root}` for untranslated pipelines; `tools/startup/gfx2hlsl.py --pending <dir>` translates them |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
-| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | per-draw render-target dumps of one frame |
+| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | capture render target 0 after translated draws in the capture window. Presents poll the fence signalled on the submitting queue. A reset discards unsubmitted copies. |
 | `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user |
