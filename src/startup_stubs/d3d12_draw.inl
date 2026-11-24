@@ -446,6 +446,8 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
     const LONG wanted = draw_dump_frame();
     if (!wanted || frame_number < wanted || frame_number > wanted + 1 || !pass.target0 || draw_dumps().full()) return;
     const D3D12_RESOURCE_DESC desc = pass.target0->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+        !x2w_draw_bmp::supported(desc.Format)) return;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rows = 0;
     UINT64 row_bytes = 0, total = 0;
@@ -488,43 +490,21 @@ void draw_dump_flush()
     int written = 0;
     for (const DrawDump& dump : completed) {
         const int index = static_cast<int>(dump.index);
-        const UINT bytes_per_pixel = dump.footprint.Footprint.RowPitch / (dump.footprint.Footprint.Width ? dump.footprint.Footprint.Width : 1);
         void* mapped = nullptr;
-        if (bytes_per_pixel != 4 || FAILED(dump.buffer->Map(0, nullptr, &mapped))) continue;
-        const UINT w = dump.footprint.Footprint.Width / 4, h = dump.rows / 4;
-        std::vector<unsigned char> pixels(std::size_t{w} * h * 4);
-        const bool bgra = dump.format == DXGI_FORMAT_B8G8R8A8_UNORM || dump.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-        for (UINT y = 0; y < h; ++y)
-            for (UINT x = 0; x < w; ++x) {
-                const unsigned char* p = static_cast<const unsigned char*>(mapped) + std::size_t{y * 4} * dump.footprint.Footprint.RowPitch + x * 16;
-                unsigned char* q = &pixels[(std::size_t{h - 1 - y} * w + x) * 4];
-                q[0] = bgra ? p[0] : p[2];
-                q[1] = p[1];
-                q[2] = bgra ? p[2] : p[0];
-                q[3] = 255;
-            }
-        dump.buffer->Unmap(0, nullptr);
+        if (FAILED(dump.buffer->Map(0, nullptr, &mapped))) continue;
         char path[MAX_PATH + 64];
         std::snprintf(path, sizeof(path), "%s\\draw_%02d_%016llx_%u.bmp", folder, index, dump.key, dump.count);
         if (FILE* file = std::fopen(path, "wb")) {
-            const std::uint32_t data = static_cast<std::uint32_t>(pixels.size());
-            unsigned char header[54] = {'B', 'M'};
-            const std::uint32_t file_size = 54 + data, offset = 54, info = 40, planes_bits = 1u | (32u << 16);
-            const std::int32_t width = static_cast<std::int32_t>(w), height = static_cast<std::int32_t>(h);
-            std::memcpy(header + 2, &file_size, 4);
-            std::memcpy(header + 10, &offset, 4);
-            std::memcpy(header + 14, &info, 4);
-            std::memcpy(header + 18, &width, 4);
-            std::memcpy(header + 22, &height, 4);
-            std::memcpy(header + 26, &planes_bits, 4);
-            std::memcpy(header + 34, &data, 4);
-            std::fwrite(header, 1, 54, file);
-            std::fwrite(pixels.data(), 1, pixels.size(), file);
-            std::fclose(file);
-            ++written;
+            const auto& fp = dump.footprint.Footprint;
+            const auto* pixels = static_cast<const unsigned char*>(mapped) + dump.footprint.Offset;
+            const bool complete = x2w_draw_bmp::write(file, pixels, fp.Width, dump.rows, fp.RowPitch, dump.format);
+            if (std::fclose(file) == 0 && complete) ++written;
+            else std::remove(path);
         }
+        const D3D12_RANGE no_writes{};
+        dump.buffer->Unmap(0, &no_writes);
     }
-    log("x2w-draw per-draw dump: %d target copies written to %s", written, folder);
+    log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)

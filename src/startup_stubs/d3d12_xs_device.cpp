@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
 
 #include <d3d12.h>

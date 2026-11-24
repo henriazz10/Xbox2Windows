@@ -241,6 +241,9 @@ add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
 
+add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
+add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
+
 add_executable(startup_dump_fence_check tests/startup_dump_fence.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_dump_fence_check PRIVATE cxx_std_17)
 target_include_directories(startup_dump_fence_check PRIVATE src)
