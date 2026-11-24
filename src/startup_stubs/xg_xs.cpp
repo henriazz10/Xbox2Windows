@@ -5,13 +5,12 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 
-#include <d3d12.h>
+#include "startup_stubs/slice_footprints.h"
 
 #include <array>
 #include <cstdio>
 #include <cstring>
 #include <utility>
-#include <vector>
 
 // Experimental (docs/startup-runtime.md). With X2W_D3D12_PERMISSIVE=1 the exports
 // stand in for the console texture-layout library; otherwise they trap.
@@ -72,7 +71,7 @@ struct Computer {
 // multiplied by the array slice index (a per-slice stride), and mip records of 0x70 bytes start at
 // +0x38 with size at +0x00, offset at +0x08, slice size at +0x10 and row pitch in bytes at +0x1c.
 // The remaining mip fields follow the usual order (pitch in pixels, alignment, padded and plain
-// dimensions, sample count) as a guess. Only plane 0 is filled.
+// dimensions, sample count) as a guess. NV12 additionally describes its interleaved chroma plane.
 constexpr std::size_t layout_header = 0x18, plane_bytes = 0x6c8, mip_base = 0x38, mip_bytes = 0x70;
 constexpr int max_mips = 15;
 
@@ -87,11 +86,10 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     const unsigned slices = volume ? 1 : desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
     if (mips > max_mips) mips = max_mips;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mips);
-    std::vector<UINT> rows(mips);
-    std::vector<UINT64> row_bytes(mips);
-    UINT64 slice_total = 0;
-    device->GetCopyableFootprints(&desc, 0, mips, 0, footprints.data(), rows.data(), row_bytes.data(), &slice_total);
+    const x2w_startup::SliceFootprints plan(device, desc, mips);
+    const auto& footprints = plan.placed;
+    const auto& rows = plan.rows;
+    UINT64 slice_total = plan.size;
     const bool valid = slice_total != ~0ull && slice_total != 0;
     if (!valid) slice_total = 0x10000;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
@@ -102,28 +100,31 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     put64(layout + 0x00, total);
     put64(layout + 0x08, 0x10000);
     put32(layout + 0x10, mips);
-    put32(layout + 0x14, 1);
-    unsigned char* plane = layout + layout_header;
-    put64(plane + 0x08, total);
-    put64(plane + 0x10, slices > 1 ? stride : 0);
-    put64(plane + 0x18, 0x10000);
-    for (unsigned i = 0; valid && i < mips; ++i) {
-        unsigned char* mip = plane + mip_base + i * mip_bytes;
-        const auto& fp = footprints[i].Footprint;
-        const u64 slice_size = u64{fp.RowPitch} * rows[i];
-        put64(mip + 0x00, slice_size * fp.Depth);
-        put64(mip + 0x08, footprints[i].Offset);
-        put64(mip + 0x10, slice_size);
-        put32(mip + 0x18, fp.Width);
-        put32(mip + 0x1c, fp.RowPitch);
-        put32(mip + 0x20, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-        put32(mip + 0x24, fp.Width);
-        put32(mip + 0x28, fp.Height);
-        put32(mip + 0x2c, volume ? fp.Depth : slices);
-        put32(mip + 0x30, fp.Width);
-        put32(mip + 0x34, fp.Height);
-        put32(mip + 0x38, volume ? fp.Depth : slices);
-        put32(mip + 0x3c, desc.SampleDesc.Count);
+    put32(layout + 0x14, plan.planes);
+    for (unsigned p = 0; p < plan.planes; ++p) {
+        unsigned char* plane = layout + layout_header + p * plane_bytes;
+        put64(plane + 0x08, total);
+        put64(plane + 0x10, slices > 1 ? stride : 0);
+        put64(plane + 0x18, 0x10000);
+        for (unsigned m = 0; valid && m < mips; ++m) {
+            const unsigned i = p * mips + m;
+            unsigned char* mip = plane + mip_base + m * mip_bytes;
+            const auto& fp = footprints[i].Footprint;
+            const u64 slice_size = u64{fp.RowPitch} * rows[i];
+            put64(mip + 0x00, slice_size * fp.Depth);
+            put64(mip + 0x08, footprints[i].Offset);
+            put64(mip + 0x10, slice_size);
+            put32(mip + 0x18, fp.Width);
+            put32(mip + 0x1c, fp.RowPitch);
+            put32(mip + 0x20, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            put32(mip + 0x24, fp.Width);
+            put32(mip + 0x28, fp.Height);
+            put32(mip + 0x2c, volume ? fp.Depth : slices);
+            put32(mip + 0x30, fp.Width);
+            put32(mip + 0x34, fp.Height);
+            put32(mip + 0x38, volume ? fp.Depth : slices);
+            put32(mip + 0x3c, desc.SampleDesc.Count);
+        }
     }
     static LONG calls, failures;
     static const bool verbose = [] { char v[8] = {}; return GetEnvironmentVariableA("X2W_XG_VERBOSE", v, sizeof v) > 0 && v[0] == '1'; }();
@@ -191,29 +192,31 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
     unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
     if (mips > max_mips) mips = max_mips;
     const unsigned mip = subresource % mips, slice = subresource / mips;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mips);
-    std::vector<UINT> rows(mips);
-    std::vector<UINT64> row_bytes(mips);
-    UINT64 slice_total = ~0ull;
-    if (device) device->GetCopyableFootprints(&desc, 0, mips, 0, footprints.data(), rows.data(), row_bytes.data(), &slice_total);
-    if (!device || !base || !linear || plane != 0 || slice >= slices || slice_total == ~0ull || !slice_total || !row_pitch) {
+    const x2w_startup::SliceFootprints plan(device, desc, mips);
+    const UINT i = plane * mips + mip;
+    const auto& footprints = plan.placed;
+    const auto& rows = plan.rows;
+    const auto& row_bytes = plan.row_bytes;
+    const UINT64 slice_total = plan.size;
+    if (!device || !base || !linear || plane >= plan.planes || slice >= slices || slice_total == ~0ull || !slice_total || !row_pitch ||
+        (desc.Format == DXGI_FORMAT_NV12 && row_pitch < row_bytes[i])) {
         if (x2w_local::first_calls(refused, 8))
             x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) refused: base=%p plane=%u subresource=%u linear=%p pitch=%u/%u",
                             static_cast<void*>(base), plane, subresource, static_cast<const void*>(linear), row_pitch, slice_pitch);
         return static_cast<long>(0x80070057);
     }
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
-    const auto& fp = footprints[mip].Footprint;
-    const u64 used = row_bytes[mip] < row_pitch ? row_bytes[mip] : row_pitch;
-    unsigned char* target = base + stride * slice + footprints[mip].Offset;
-    const u64 target_bytes = u64{fp.RowPitch} * rows[mip] * fp.Depth;
-    const u64 source_slice = slice_pitch ? slice_pitch : u64{row_pitch} * rows[mip];
+    const auto& fp = footprints[i].Footprint;
+    const u64 used = row_bytes[i] < row_pitch ? row_bytes[i] : row_pitch;
+    unsigned char* target = base + stride * slice + footprints[i].Offset;
+    const u64 target_bytes = plan.bytes(i);
+    const u64 source_slice = slice_pitch ? slice_pitch : u64{row_pitch} * rows[i];
     const bool ok = x2w_local::writable(target, target_bytes) &&
-                    x2w_local::readable(linear, source_slice * (fp.Depth - 1) + u64{row_pitch} * (rows[mip] - 1) + used);
+                    x2w_local::readable(linear, source_slice * (fp.Depth - 1) + u64{row_pitch} * (rows[i] - 1) + used);
     if (ok) {
         for (unsigned z = 0; z < fp.Depth; ++z)
-            for (unsigned y = 0; y < rows[mip]; ++y)
-                std::memcpy(target + (u64{z} * rows[mip] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
+            for (unsigned y = 0; y < rows[i]; ++y)
+                std::memcpy(target + (u64{z} * rows[i] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
         using Notify = void (*)(void*, unsigned long long);
         static const Notify notify = [] {
             const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
@@ -224,7 +227,7 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
     if (x2w_local::first_calls(calls, 12) || !ok)
         x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u (mip %u slice %u) %ux%u fmt=%d rows=%u "
                         "pitch %u->%u -> %s", static_cast<void*>(base), subresource, mip, slice, fp.Width, fp.Height, desc.Format,
-                        rows[mip], row_pitch, fp.RowPitch, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
+                        rows[i], row_pitch, fp.RowPitch, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
     return ok ? 0 : static_cast<long>(0x80004005);
 }
 
@@ -269,7 +272,12 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         ready = true;
     }
     if (!rcx || !rdx) return static_cast<long>(0x80004003);
-    auto* computer = new Computer{table.data(), *reinterpret_cast<const D3D12_RESOURCE_DESC*>(rcx), 1};
+    const auto& desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(rcx);
+    if (!x2w_startup::SliceFootprints::supports(desc)) {
+        *reinterpret_cast<Computer**>(rdx) = nullptr;
+        return E_NOTIMPL;
+    }
+    auto* computer = new Computer{table.data(), desc, 1};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
     if (InterlockedIncrement(&calls) <= 3)

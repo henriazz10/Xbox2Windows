@@ -377,10 +377,8 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
     const UINT slices = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     if (mips > 15) return;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[15];
-    UINT rows[15];
-    UINT64 row_bytes[15], slice_total = 0;
-    device_of(the_device)->GetCopyableFootprints(&desc, 0, mips, 0, footprints, rows, row_bytes, &slice_total);
+    const x2w_startup::SliceFootprints plan(device_of(the_device), desc, mips);
+    const UINT64 slice_total = plan.size;
     if (slice_total == ~0ull || !slice_total) return;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = slices > 1 ? stride * (slices - 1) + slice_total : slice_total;
@@ -404,22 +402,21 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         state.generation = generation;
         return;
     }
+    require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (UINT s = 0; s < slices; ++s)
+        for (UINT i = 0; i < plan.count; ++i) {
+            const auto& fp = plan.placed[i];
+            const u64 bytes = plan.bytes(i);
+            u64 offset = 0;
+            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+                state.done = false;
+                return;
+            }
+            plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+        }
     state.hash = hash;
     state.generation = generation;
     state.done = true;
-    require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    for (UINT s = 0; s < slices; ++s)
-        for (UINT m = 0; m < mips; ++m) {
-            const auto& fp = footprints[m];
-            const u64 bytes = u64{fp.Footprint.RowPitch} * rows[m] * fp.Footprint.Depth;
-            u64 offset = 0;
-            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) continue;
-            D3D12_TEXTURE_COPY_LOCATION source{upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            source.PlacedFootprint = {offset, fp.Footprint};
-            D3D12_TEXTURE_COPY_LOCATION target{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            target.SubresourceIndex = m + s * mips;
-            list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
-        }
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
     static LONG shown;

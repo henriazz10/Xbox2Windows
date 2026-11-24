@@ -113,3 +113,18 @@ These are measured on one executable; treat them as hypotheses for others.
 - Dynamically indexed sampler-heap loads become a default sampler.
 - Stream pipelines (console subobject streams) have no shader translation.
 - Audio produces no output.
+
+
+## NV12 plane upload
+
+For a single-mip, single-sample, even-sized 2D NV12 image the desktop stand-in
+reports two linear footprints. XG copies luma and interleaved chroma separately,
+and the draw uploader addresses both D3D12 subresources. NV12 arrays remain
+unsupported. The source-built draw compares a synthetic image and its U/V-swapped
+control against the same integer colour conversion on the CPU. This verifies
+the stand-in path; the texture format used in the reported video remains to be confirmed.
+
+```powershell
+cmake --build --preset release --target startup_nv12_draw d3d12_xs_shim
+ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
+```

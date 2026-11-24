@@ -15,6 +15,8 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 
+#include "startup_stubs/slice_footprints.h"
+
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
